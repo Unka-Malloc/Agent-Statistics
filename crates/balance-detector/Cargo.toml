@@ -1,0 +1,12 @@
+[package]
+name = "balance-detector"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Queries provider account surfaces for remaining credit and subscription quota windows (weekly/monthly remaining share), with the account bound by the host and responses mapped declaratively."
+
+[dependencies]
+licoup-extension-contracts.workspace = true
+serde_json.workspace = true
