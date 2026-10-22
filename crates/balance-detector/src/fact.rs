@@ -68,6 +68,23 @@ pub enum BalanceFact {
     Unlimited,
 }
 
+/// An exact decimal as the provider wrote it: an optional sign, at least one
+/// integer digit, and at most one non-empty fraction. The text is kept
+/// verbatim for the ledger; only its shape is decided here, so `+4.20`,
+/// `0.5` and `12` are amounts while `.`, `1-2` and `many` are not.
+fn is_exact_decimal(text: &str) -> bool {
+    let unsigned = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let (integer, fraction) = match unsigned.split_once('.') {
+        Some((integer, fraction)) => (integer, Some(fraction)),
+        None => (unsigned, None),
+    };
+    !integer.is_empty()
+        && integer.chars().all(|character| character.is_ascii_digit())
+        && fraction.is_none_or(|part| {
+            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
+        })
+}
+
 impl BalanceFact {
     /// Structural validation of one fact.
     ///
@@ -80,12 +97,7 @@ impl BalanceFact {
                 remaining,
                 currency,
             } => {
-                if remaining.is_empty()
-                    || remaining.len() > 64
-                    || !remaining
-                        .chars()
-                        .all(|character| character.is_ascii_digit() || ".-+".contains(character))
-                {
+                if remaining.len() > 64 || !is_exact_decimal(remaining) {
                     return Err(refusal("balance_fact_invalid").with_field("credit.remaining"));
                 }
                 if currency.len() != 3 || !currency.chars().all(|c| c.is_ascii_alphabetic()) {
@@ -118,9 +130,14 @@ impl BalanceFact {
                     return Err(refusal("balance_fact_invalid").with_field("quota.unit"));
                 }
                 if let Some(amount) = remaining_amount
-                    && (amount.is_empty() || amount.len() > 64)
+                    && (amount.len() > 64 || !is_exact_decimal(amount))
                 {
                     return Err(refusal("balance_fact_invalid").with_field("quota.remainingAmount"));
+                }
+                if let Some(unit) = unit
+                    && (unit.is_empty() || unit.len() > 32)
+                {
+                    return Err(refusal("balance_fact_invalid").with_field("quota.unit"));
                 }
                 if let Some(resets) = resets_at
                     && (resets.is_empty() || resets.len() > 64)
@@ -143,19 +160,24 @@ mod tests {
 
     #[test]
     fn a_credit_fact_requires_an_exact_amount_and_a_currency() {
-        let fact = BalanceFact::Credit {
-            remaining: "12.50".to_owned(),
-            currency: "USD".to_owned(),
-        };
-        assert!(fact.validate().is_ok());
-        let bad = BalanceFact::Credit {
-            remaining: "many".to_owned(),
-            currency: "USD".to_owned(),
-        };
-        assert_eq!(
-            bad.validate().expect_err("not an amount").field.as_deref(),
-            Some("credit.remaining")
-        );
+        for good in ["12.50", "0", "+4.2", "-0.01", "410000"] {
+            let fact = BalanceFact::Credit {
+                remaining: good.to_owned(),
+                currency: "USD".to_owned(),
+            };
+            assert!(fact.validate().is_ok(), "{good} is an exact amount");
+        }
+        for bad_amount in ["many", ".", "+", "--1", "1-2", "4.", ".5", "4.2.0", ""] {
+            let bad = BalanceFact::Credit {
+                remaining: bad_amount.to_owned(),
+                currency: "USD".to_owned(),
+            };
+            assert_eq!(
+                bad.validate().unwrap_err().field.as_deref(),
+                Some("credit.remaining"),
+                "{bad_amount} is not an exact amount"
+            );
+        }
         let bad = BalanceFact::Credit {
             remaining: "12.50".to_owned(),
             currency: "dollars".to_owned(),
@@ -220,6 +242,37 @@ mod tests {
                 .as_deref(),
             Some("quota.unit")
         );
+
+        let empty_unit = BalanceFact::Quota {
+            remaining_percent: None,
+            remaining_amount: Some("900".to_owned()),
+            unit: Some(String::new()),
+            resets_at: None,
+            window: QuotaWindow::Monthly,
+        };
+        assert_eq!(
+            empty_unit
+                .validate()
+                .expect_err("empty unit")
+                .field
+                .as_deref(),
+            Some("quota.unit")
+        );
+
+        for bad_amount in ["many", "..", "1-2", "4."] {
+            let malformed = BalanceFact::Quota {
+                remaining_percent: None,
+                remaining_amount: Some(bad_amount.to_owned()),
+                unit: Some("tokens".to_owned()),
+                resets_at: None,
+                window: QuotaWindow::Monthly,
+            };
+            assert_eq!(
+                malformed.validate().unwrap_err().field.as_deref(),
+                Some("quota.remainingAmount"),
+                "{bad_amount} is not an exact amount"
+            );
+        }
     }
 
     #[test]

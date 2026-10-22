@@ -276,6 +276,12 @@ impl FieldMapping {
         };
 
         if operation == UsageOperation::Upsert && metrics.is_empty() {
+            // A record carrying only a cost claims something the contract
+            // cannot express — an upsert requires at least one metric — so it
+            // is refused rather than silently discarded as "claims nothing".
+            if cost.is_some() {
+                return Err(refusal("usage_mapping_invalid").with_field("cost"));
+            }
             return Ok(None);
         }
         let observation = UsageObservation {
@@ -622,6 +628,27 @@ mod tests {
         assert_eq!(tokens.value, None, "a missing count is not a zero");
         assert_eq!(bound.observation.source_epoch, "epoch-1");
         assert_eq!(bound.observation.scope_ref, "scope-1");
+    }
+
+    #[test]
+    fn a_cost_only_record_is_refused_not_dropped() {
+        let mut mapping = specialist_mapping();
+        mapping.metrics.clear();
+        mapping.unknown_metrics.clear();
+        mapping.cost = Some(CostFieldMapping {
+            amount: "cost.amount".to_owned(),
+            currency: "cost.currency".to_owned(),
+            quality: Quality::Reported,
+        });
+        let record = serde_json::json!({
+            "id": "run-1",
+            "at": "2026-09-21T00:00:00Z",
+            "cost": { "amount": "0.0042", "currency": "USD" },
+        });
+        let failure = mapping
+            .normalize(&record, &binding(), None)
+            .expect_err("an upsert needs a metric");
+        assert_eq!(failure.field.as_deref(), Some("cost"));
     }
 
     #[test]
