@@ -9,6 +9,7 @@ description = "Local usage measurement, aggregation and metering journal engine:
 
 [dependencies]
 token-usage-detector.workspace = true
+acativa.workspace = true
 anyhow.workspace = true
 licoup-client-state.workspace = true
 licoup-extension-contracts.workspace = true

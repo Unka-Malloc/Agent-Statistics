@@ -4,11 +4,11 @@ use crate::contract::{
     AGENT_USAGE_MODE, AGENT_USAGE_SCHEMA_VERSION, AGENT_USAGE_TOKEN_SOURCE_MODE,
     HistoryUsageSummary, MAX_REPORTS, REPORT_COLLECTION, number_field, supported_agents,
 };
-use crate::ledger::{
-    WORKFLOW_LEDGER_REPORT_SCHEMA, WORKFLOW_LEDGER_RESULT_KIND, WORKFLOW_LEDGER_SCHEMA_VERSION,
-};
 use crate::model_identity::normalize_retained_report;
 use crate::params::text_param;
+use acativa::usage_ledger::{
+    WORKFLOW_LEDGER_REPORT_SCHEMA, WORKFLOW_LEDGER_RESULT_KIND, WORKFLOW_LEDGER_SCHEMA_VERSION,
+};
 use anyhow::{Context, Result};
 use licoup_client_state::ClientStateStore;
 use serde_json::Value;

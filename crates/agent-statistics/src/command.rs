@@ -78,7 +78,7 @@ pub fn scan(params: &Value) -> Result<Value> {
         }));
     }
 
-    let workflow_report_value = crate::ledger::workflow_report(params)
+    let workflow_report_value = acativa::usage_ledger::workflow_report(params)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
 
     let report = json!({
@@ -135,7 +135,7 @@ pub fn report(params: &Value) -> Result<Value> {
         text_param(params, &["agent", "target"]).map(|value| normalize_agent_id(&value));
     let limit = number_param(params, "limit").unwrap_or(10) as usize;
     let reports = read_retained_reports(params, agent_filter.as_deref(), limit, &registry)?;
-    let workflow_report_value = crate::ledger::workflow_report(params)
+    let workflow_report_value = acativa::usage_ledger::workflow_report(params)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     // What the base ledger holds right now: the facts the scans settled and the
     // obligations the workflow ledger still leaves open. A store this client

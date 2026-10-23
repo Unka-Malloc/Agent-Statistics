@@ -20,7 +20,6 @@ pub mod gateway;
 pub mod host;
 pub mod incremental;
 pub mod journal;
-pub mod ledger;
 pub mod normalize;
 pub mod persistence;
 pub mod source_host;

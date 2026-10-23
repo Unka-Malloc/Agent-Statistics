@@ -30,7 +30,7 @@
 //! host's fact too: when it issues a measurement, every report of that
 //! measurement settles into one fact instead of one per source.
 
-use crate::ledger::{Ledger, LedgerError, LedgerResult, now_ms, open_ledger};
+use acativa::usage_ledger::{Ledger, LedgerError, LedgerResult, now_ms, open_ledger};
 use licoup_extension_contracts::usage::{ExactNumber, Quality, UsageObservation, UsageOperation};
 use licoup_extension_contracts::{ApplicationFailure, is_namespaced};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
@@ -262,18 +262,34 @@ impl FactPage {
 /// current epoch and the authorized scopes; the grant is the host's decision,
 /// never the producer's. A source the host composes cannot settle anything by
 /// reporting `reported`.
+///
+/// The admission is a capability: its fields are sealed so only the crate's own
+/// composition can mint one, and [`crate::source_host::UsageSourceHost::admit_source`]
+/// is the public issuance path a host drives. A caller that never passes
+/// through the host cannot fabricate an admission, and an issued one cannot be
+/// reshaped — every journal entry point requires one by reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SourceAdmission {
-    pub binding: SourceBinding,
-    pub eligibility: SettlementEligibility,
+    binding: SourceBinding,
+    eligibility: SettlementEligibility,
 }
 
 impl SourceAdmission {
-    pub fn new(binding: SourceBinding, eligibility: SettlementEligibility) -> Self {
+    pub(crate) fn new(binding: SourceBinding, eligibility: SettlementEligibility) -> Self {
         Self {
             binding,
             eligibility,
         }
+    }
+
+    /// The transport binding the host issued for this source.
+    pub fn binding(&self) -> &SourceBinding {
+        &self.binding
+    }
+
+    /// The settlement authority the host grants this source.
+    pub fn eligibility(&self) -> SettlementEligibility {
+        self.eligibility
     }
 }
 
@@ -329,26 +345,88 @@ pub trait UsageSourcePort {
 /// It is read-mostly: a consumer may record an admitted fact and retract one,
 /// and read the facts and the obligations the ledger still holds. It cannot
 /// rewrite a fact it does not own and it cannot compute a settlement.
+///
+/// Every mutation names its `owner` — the consumer identity the host composed
+/// for the caller. The journal enforces it: a fact records only under the
+/// owner its `source_ref` names, and an existing fact answers only to the
+/// owner it was recorded under. A fact an observation event settled is never
+/// touched by this port at all — the event's own settlement path corrects or
+/// withdraws it. Settlement eligibility is the host's grant at record time
+/// and stays immutable on a consumer's update.
 pub trait MeteringFactPort {
-    /// Record one fact, keyed by `fact_id`.
-    fn record(&mut self, fact: MeteringFact) -> LedgerResult<FactReceipt>;
-    /// Record a bounded set of facts as one delivery, each keyed by its own
-    /// `fact_id`.
+    /// Record one fact under `owner`, keyed by `fact_id`.
+    fn record(&mut self, owner: &str, fact: MeteringFact) -> LedgerResult<FactReceipt>;
+    /// Record a bounded set of facts under `owner` as one delivery, each keyed
+    /// by its own `fact_id`.
     ///
     /// The default records them one at a time, which is all a port without a
     /// transactional store can promise. A port over a store that has one
     /// commits the delivery together, so settling a whole reading costs one
     /// transaction instead of one per fact.
-    fn record_all(&mut self, facts: Vec<MeteringFact>) -> LedgerResult<Vec<FactReceipt>> {
-        facts.into_iter().map(|fact| self.record(fact)).collect()
+    fn record_all(
+        &mut self,
+        owner: &str,
+        facts: Vec<MeteringFact>,
+    ) -> LedgerResult<Vec<FactReceipt>> {
+        facts
+            .into_iter()
+            .map(|fact| self.record(owner, fact))
+            .collect()
     }
-    /// Withdraw one fact by identity. It cancels that fact and nothing else.
-    fn retract(&mut self, fact_id: &str) -> LedgerResult<FactReceipt>;
+    /// Withdraw one fact the caller owns, by identity. It cancels that fact
+    /// and nothing else.
+    fn retract(&mut self, owner: &str, fact_id: &str) -> LedgerResult<FactReceipt>;
     /// Read facts, by cursor.
     fn read(&self, cursor: Option<&str>, limit: usize) -> LedgerResult<FactPage>;
     /// The obligations the ledger still holds unsettled.
     fn pending(&self) -> LedgerResult<Vec<PendingObligation>>;
 }
+
+/// The journal's own schema inside the shared usage store. The Graph-run
+/// tables belong to `acativa::usage_ledger`; these are additive tables of the
+/// same durable file, created idempotently whichever owner opens first.
+const USAGE_JOURNAL_INIT: &str = "CREATE TABLE IF NOT EXISTS usage_source_events (
+             source_ref TEXT NOT NULL,
+             source_epoch TEXT NOT NULL,
+             observation_id TEXT NOT NULL,
+             revision INTEGER NOT NULL,
+             scope_ref TEXT NOT NULL,
+             measurement_ref TEXT,
+             observed_at TEXT NOT NULL,
+             content_digest TEXT NOT NULL,
+             retracted INTEGER NOT NULL DEFAULT 0,
+             settled_at_ms INTEGER NOT NULL,
+             PRIMARY KEY(source_ref,source_epoch,observation_id)
+           );
+           CREATE TABLE IF NOT EXISTS usage_source_facts (
+             fact_id TEXT PRIMARY KEY,
+             scope_ref TEXT NOT NULL,
+             metric TEXT NOT NULL,
+             value TEXT,
+             unit TEXT NOT NULL,
+             quality TEXT NOT NULL,
+             eligibility TEXT NOT NULL,
+             source_ref TEXT NOT NULL,
+             source_epoch TEXT NOT NULL,
+             observation_id TEXT NOT NULL,
+             observed_at TEXT NOT NULL,
+             revision INTEGER,
+             retracted INTEGER NOT NULL DEFAULT 0,
+             updated_at_ms INTEGER NOT NULL
+           );
+           CREATE INDEX IF NOT EXISTS usage_source_facts_scope
+             ON usage_source_facts(scope_ref,metric,fact_id);
+           CREATE INDEX IF NOT EXISTS usage_source_facts_event
+             ON usage_source_facts(source_ref,source_epoch,observation_id);
+           CREATE TABLE IF NOT EXISTS usage_source_cursors (
+             source_ref TEXT NOT NULL,
+             source_epoch TEXT NOT NULL,
+             scope_ref TEXT NOT NULL,
+             sequence INTEGER NOT NULL,
+             cursor TEXT NOT NULL,
+             updated_at_ms INTEGER NOT NULL,
+             PRIMARY KEY(source_ref,source_epoch)
+           );";
 
 /// The base usage journal, in the kernel's ledger store.
 pub struct UsageJournal {
@@ -358,9 +436,12 @@ pub struct UsageJournal {
 impl UsageJournal {
     /// Open the base ledger the journal shares with the graph-run reservations.
     pub fn open(params: &Value) -> LedgerResult<Self> {
-        Ok(Self {
-            ledger: open_ledger(params)?,
-        })
+        let ledger = open_ledger(params)?;
+        ledger
+            .connection
+            .execute_batch(USAGE_JOURNAL_INIT)
+            .map_err(|_| LedgerError::storage())?;
+        Ok(Self { ledger })
     }
 
     /// The exact total of one scope and metric over the facts that may settle.
@@ -414,8 +495,20 @@ impl UsageSourcePort for UsageJournal {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| LedgerError::storage())?;
         let mut events = Vec::with_capacity(admitted.accepted.len());
-        for bound in &admitted.accepted {
-            events.push(settle_event(&transaction, admission, bound)?);
+        let accepted_count = admitted.accepted_count();
+        let mut refused = admitted.refused;
+        for (index, bound) in admitted.accepted.iter().enumerate() {
+            match settle_event(&transaction, admission, bound) {
+                Ok(settlement) => events.push(settlement),
+                // A settlement refusal isolates to its own observation: the
+                // neighbours the batch carried still commit. A storage failure
+                // is different — nothing commits over a broken store.
+                Err(error) if error.retryable => return Err(error),
+                Err(error) => refused.push(BatchRefusal {
+                    index,
+                    failure: failure_from(error),
+                }),
+            }
         }
         let cursor = stored_cursor(
             &transaction,
@@ -426,8 +519,8 @@ impl UsageSourcePort for UsageJournal {
         transaction.commit().map_err(|_| LedgerError::storage())?;
         Ok(IngestReport {
             source_ref: admission.binding.source_ref.clone(),
-            accepted: admitted.accepted_count(),
-            refused: admitted.refused,
+            accepted: accepted_count,
+            refused,
             events,
             cursor,
         })
@@ -520,7 +613,16 @@ impl UsageSourcePort for UsageJournal {
                 .binding
                 .bind_observation(observation.clone(), None)
             {
-                Ok(bound) => events.push(settle_event(&transaction, admission, &bound)?),
+                Ok(bound) => match settle_event(&transaction, admission, &bound) {
+                    Ok(settlement) => events.push(settlement),
+                    // Same isolation as publish: a refused observation reports
+                    // itself and does not pin the page's cursor.
+                    Err(error) if error.retryable => return Err(error),
+                    Err(error) => refused.push(BatchRefusal {
+                        index,
+                        failure: failure_from(error),
+                    }),
+                },
                 Err(failure) => refused.push(BatchRefusal { index, failure }),
             }
         }
@@ -586,17 +688,35 @@ impl UsageSourcePort for UsageJournal {
     }
 }
 
+/// The owner a consumer names must name itself: non-empty, bounded, and equal
+/// to the `source_ref` every fact it records carries. An owner that names
+/// another consumer's facts is refused, not trusted.
+fn require_owner(owner: &str) -> LedgerResult<()> {
+    if owner.trim().is_empty() || owner.len() > 256 {
+        return Err(LedgerError::refused(STAGE, "usage_journal_owner_invalid"));
+    }
+    Ok(())
+}
+
 impl MeteringFactPort for UsageJournal {
-    fn record(&mut self, fact: MeteringFact) -> LedgerResult<FactReceipt> {
-        let mut receipts = self.record_all(vec![fact])?;
+    fn record(&mut self, owner: &str, fact: MeteringFact) -> LedgerResult<FactReceipt> {
+        let mut receipts = self.record_all(owner, vec![fact])?;
         Ok(receipts.remove(0))
     }
 
     /// One delivery, one transaction: a host settling a whole reading commits
     /// its facts together instead of paying a commit per fact.
-    fn record_all(&mut self, facts: Vec<MeteringFact>) -> LedgerResult<Vec<FactReceipt>> {
+    fn record_all(
+        &mut self,
+        owner: &str,
+        facts: Vec<MeteringFact>,
+    ) -> LedgerResult<Vec<FactReceipt>> {
+        require_owner(owner)?;
         for fact in &facts {
             fact.validate()?;
+            if fact.source_ref != owner {
+                return Err(LedgerError::refused(STAGE, "usage_journal_owner_mismatch"));
+            }
         }
         let transaction = self
             .ledger
@@ -607,34 +727,44 @@ impl MeteringFactPort for UsageJournal {
         for fact in &facts {
             receipts.push(FactReceipt {
                 fact_id: fact.fact_id.clone(),
-                outcome: write_fact(&transaction, fact, None)?,
+                outcome: write_consumer_fact(&transaction, owner, fact)?,
             });
         }
         transaction.commit().map_err(|_| LedgerError::storage())?;
         Ok(receipts)
     }
 
-    fn retract(&mut self, fact_id: &str) -> LedgerResult<FactReceipt> {
+    fn retract(&mut self, owner: &str, fact_id: &str) -> LedgerResult<FactReceipt> {
+        require_owner(owner)?;
         let transaction = self
             .ledger
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| LedgerError::storage())?;
+        // A consumer withdraws only its own fact: never an event-owned one and
+        // never another consumer's. The owner and ownership clauses in the
+        // statement are the check itself, not a pre-read a race could outrun.
         let updated = transaction
             .execute(
-                "UPDATE usage_source_facts SET retracted=1,updated_at_ms=?2
-                 WHERE fact_id=?1 AND retracted=0",
-                params![fact_id, now_ms()],
+                "UPDATE usage_source_facts SET retracted=1,updated_at_ms=?3
+                 WHERE fact_id=?1 AND source_ref=?2 AND observation_id='' AND retracted=0",
+                params![fact_id, owner, now_ms()],
             )
             .map_err(|_| LedgerError::storage())?;
+        let outcome = if updated == 1 {
+            FactOutcome::Withdrawn
+        } else {
+            match load_fact(&transaction, fact_id)? {
+                None => FactOutcome::UnknownFact,
+                Some(_) => {
+                    return Err(LedgerError::refused(STAGE, "usage_journal_fact_not_owned"));
+                }
+            }
+        };
         transaction.commit().map_err(|_| LedgerError::storage())?;
         Ok(FactReceipt {
             fact_id: fact_id.to_owned(),
-            outcome: if updated == 0 {
-                FactOutcome::UnknownFact
-            } else {
-                FactOutcome::Withdrawn
-            },
+            outcome,
         })
     }
 
@@ -698,35 +828,25 @@ impl MeteringFactPort for UsageJournal {
     }
 
     fn pending(&self) -> LedgerResult<Vec<PendingObligation>> {
-        let mut statement = self
-            .ledger
-            .connection
-            .prepare(
-                "SELECT DISTINCT COALESCE(run_id,invocation_id),state
-                 FROM graph_usage_reservations
-                 WHERE state IN ('reserved','unknown')
-                 ORDER BY 1,2",
-            )
-            .map_err(|_| LedgerError::storage())?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|_| LedgerError::storage())?;
-        let mut obligations = Vec::new();
-        for row in rows {
-            let (scope_ref, state) = row.map_err(|_| LedgerError::storage())?;
-            obligations.push(PendingObligation {
-                scope_ref,
-                metric: PENDING_METRIC.to_owned(),
-                reason: match state.as_str() {
-                    "reserved" => "in-flight",
-                    _ => "unknown-usage",
-                }
-                .to_owned(),
-            });
-        }
-        Ok(obligations)
+        // The journal reports what the shared store still holds unsettled. The
+        // reservation rows belong to the Graph ledger (`acativa::usage_ledger`)
+        // — this read goes through that owner's API rather than naming its
+        // tables, so a home the Graph owner never opened reports no
+        // obligations instead of failing on a missing table.
+        Ok(
+            acativa::usage_ledger::pending_graph_obligations(&self.ledger.connection)?
+                .into_iter()
+                .map(|obligation| PendingObligation {
+                    scope_ref: obligation.scope_ref,
+                    metric: PENDING_METRIC.to_owned(),
+                    reason: match obligation.state.as_str() {
+                        "reserved" => "in-flight",
+                        _ => "unknown-usage",
+                    }
+                    .to_owned(),
+                })
+                .collect(),
+        )
     }
 }
 
@@ -885,7 +1005,8 @@ fn settle_event(
             transaction
                 .execute(
                     "UPDATE usage_source_events SET
-                       revision=?4,content_digest=?5,measurement_ref=?6,retracted=0,settled_at_ms=?7
+                       revision=?4,content_digest=?5,measurement_ref=?6,retracted=0,
+                       scope_ref=?8,observed_at=?9,settled_at_ms=?7
                      WHERE source_ref=?1 AND source_epoch=?2 AND observation_id=?3",
                     params![
                         &key.source_ref,
@@ -895,9 +1016,12 @@ fn settle_event(
                         &incoming_digest,
                         measurement_ref.as_deref(),
                         now_ms(),
+                        &bound.observation.scope_ref,
+                        &bound.observation.observed_at,
                     ],
                 )
                 .map_err(|_| LedgerError::storage())?;
+            reconcile_event_facts(transaction, &owner, &facts)?;
             let mut corrected = Vec::with_capacity(facts.len());
             for fact in &facts {
                 let outcome = write_fact(transaction, fact, Some(&owner))?;
@@ -1004,7 +1128,9 @@ fn write_fact(
                  ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0,?13)
                  ON CONFLICT(fact_id) DO UPDATE SET
                    scope_ref=excluded.scope_ref,metric=excluded.metric,value=excluded.value,
-                   unit=excluded.unit,quality=excluded.quality,eligibility=excluded.eligibility,
+                   unit=excluded.unit,quality=excluded.quality,
+                   eligibility=CASE WHEN ?14=0 THEN usage_source_facts.eligibility
+                     ELSE excluded.eligibility END,
                    source_ref=excluded.source_ref,
                    source_epoch=CASE WHEN ?14=0 THEN usage_source_facts.source_epoch
                      ELSE excluded.source_epoch END,
@@ -1033,6 +1159,50 @@ fn write_fact(
             .map_err(|_| LedgerError::storage())?;
     }
     Ok(outcome)
+}
+
+/// Reconcile one event's owned fact set against what a correction reports:
+/// anything the event still owns that this revision no longer names is
+/// withdrawn, so a removed metric or a moved scope cannot keep counting.
+/// Facts another event owns under the same identity are untouched — the
+/// ownership columns, not the fact id, decide what the event may retract.
+fn reconcile_event_facts(
+    transaction: &rusqlite::Transaction<'_>,
+    owner: &FactOwner<'_>,
+    facts: &[MeteringFact],
+) -> LedgerResult<()> {
+    let keep: std::collections::BTreeSet<&str> =
+        facts.iter().map(|fact| fact.fact_id.as_str()).collect();
+    let mut statement = transaction
+        .prepare(
+            "SELECT fact_id FROM usage_source_facts
+             WHERE source_ref=?1 AND source_epoch=?2 AND observation_id=?3 AND retracted=0",
+        )
+        .map_err(|_| LedgerError::storage())?;
+    let owned = statement
+        .query_map(
+            params![owner.source_ref, owner.source_epoch, owner.observation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| LedgerError::storage())?;
+    let mut stale = Vec::new();
+    for fact_id in owned {
+        let fact_id = fact_id.map_err(|_| LedgerError::storage())?;
+        if !keep.contains(fact_id.as_str()) {
+            stale.push(fact_id);
+        }
+    }
+    drop(statement);
+    for fact_id in stale {
+        transaction
+            .execute(
+                "UPDATE usage_source_facts SET retracted=1,revision=?2,updated_at_ms=?3
+                 WHERE fact_id=?1 AND retracted=0",
+                params![fact_id, i64::from(owner.revision), now_ms()],
+            )
+            .map_err(|_| LedgerError::storage())?;
+    }
+    Ok(())
 }
 
 /// Mark every fact of one event withdrawn, without touching another event's
@@ -1095,6 +1265,11 @@ struct FactRow {
     unit: String,
     quality: Quality,
     eligibility: SettlementEligibility,
+    /// The consumer or source the fact was recorded under.
+    source_ref: String,
+    /// Non-empty marks a fact an observation event settled; empty marks one a
+    /// consumer recorded directly.
+    observation_id: String,
     revision: Option<u32>,
     retracted: bool,
 }
@@ -1108,6 +1283,12 @@ impl FactRow {
             && self.quality == fact.quality
             && self.eligibility == fact.eligibility
     }
+
+    /// A fact an observation event settled answers only to that event's own
+    /// settlement path — a consumer record or retract never touches it.
+    fn is_event_owned(&self) -> bool {
+        !self.observation_id.is_empty()
+    }
 }
 
 fn load_fact(
@@ -1116,7 +1297,8 @@ fn load_fact(
 ) -> LedgerResult<Option<FactRow>> {
     transaction
         .query_row(
-            "SELECT scope_ref,metric,value,unit,quality,eligibility,revision,retracted
+            "SELECT scope_ref,metric,value,unit,quality,eligibility,source_ref,
+                    observation_id,revision,retracted
              FROM usage_source_facts WHERE fact_id=?1",
             params![fact_id],
             |row| {
@@ -1127,8 +1309,10 @@ fn load_fact(
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, i64>(7)? != 0,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, i64>(9)? != 0,
                 ))
             },
         )
@@ -1136,19 +1320,46 @@ fn load_fact(
         .map_err(|_| LedgerError::storage())
         .and_then(|row| match row {
             None => Ok(None),
-            Some((scope_ref, metric, value, unit, quality, eligibility, revision, retracted)) => {
-                Ok(Some(FactRow {
-                    scope_ref,
-                    metric,
-                    value,
-                    unit,
-                    quality: quality_from(&quality)?,
-                    eligibility: SettlementEligibility::parse(&eligibility)?,
-                    revision: revision.and_then(|revision| u32::try_from(revision).ok()),
-                    retracted,
-                }))
-            }
+            Some((
+                scope_ref,
+                metric,
+                value,
+                unit,
+                quality,
+                eligibility,
+                source_ref,
+                observation_id,
+                revision,
+                retracted,
+            )) => Ok(Some(FactRow {
+                scope_ref,
+                metric,
+                value,
+                unit,
+                quality: quality_from(&quality)?,
+                eligibility: SettlementEligibility::parse(&eligibility)?,
+                source_ref,
+                observation_id,
+                revision: revision.and_then(|revision| u32::try_from(revision).ok()),
+                retracted,
+            })),
         })
+}
+
+/// Write one fact through the consumer port: the row answers only to the owner
+/// it was recorded under, and an event-owned fact is refused outright — the
+/// event's settlement path is the only writer of what it owns.
+fn write_consumer_fact(
+    transaction: &rusqlite::Transaction<'_>,
+    owner: &str,
+    fact: &MeteringFact,
+) -> LedgerResult<FactOutcome> {
+    if let Some(existing) = load_fact(transaction, &fact.fact_id)?
+        && (existing.is_event_owned() || existing.source_ref != owner)
+    {
+        return Err(LedgerError::refused(STAGE, "usage_journal_fact_not_owned"));
+    }
+    write_fact(transaction, fact, None)
 }
 
 /// Whether the host composed this observation under this admission: the same
@@ -1177,11 +1388,20 @@ fn fact_id(scope_ref: &str, identity: &str, metric: &str) -> String {
     format!("{scope_ref}#{identity}#{metric}")
 }
 
-/// A digest of everything a producer claimed, so a replay at one revision with
-/// different content is refused instead of silently rewriting a settled fact.
+/// A digest of everything a producer claimed — including the scope and the
+/// producer's own timestamp, which decide which facts the observation owns —
+/// so a replay at one revision with different content is refused instead of
+/// silently rewriting a settled fact or silently keeping a stale-scope one.
 fn content_digest(observation: &UsageObservation) -> LedgerResult<String> {
-    let encoded = serde_json::to_vec(&(&observation.metrics, &observation.cost))
-        .map_err(|_| LedgerError::refused(STAGE, "usage_journal_event_unencodable"))?;
+    let encoded = serde_json::to_vec(&(
+        &observation.scope_ref,
+        &observation.observed_at,
+        &observation.operation,
+        &observation.interval_start,
+        &observation.metrics,
+        &observation.cost,
+    ))
+    .map_err(|_| LedgerError::refused(STAGE, "usage_journal_event_unencodable"))?;
     let mut hasher = Sha256::new();
     hasher.update(&encoded);
     let mut digest = String::with_capacity(64);
@@ -1275,10 +1495,21 @@ fn from_refusal(failure: ApplicationFailure) -> LedgerError {
     }
 }
 
+/// Carry a journal refusal into the report's refusal vocabulary, preserving the
+/// code the caller reconciles on. Storage failures never reach this shape —
+/// they abort the batch instead.
+fn failure_from(error: LedgerError) -> ApplicationFailure {
+    if error.retryable {
+        ApplicationFailure::retryable(error.code, error.stage)
+    } else {
+        ApplicationFailure::permanent(error.code, error.stage)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::{reserve_graph_command, settle_graph_command};
+    use acativa::usage_ledger::{reserve_graph_command, settle_graph_command};
     use licoup_extension_contracts::usage::{
         CostObservation, MetricValue, Temporality, UsageObservation,
     };
@@ -1798,10 +2029,15 @@ mod tests {
             .publish(&admission, &batch(&[metric_upsert("obs-1", 1, "120")]))
             .expect("settled");
 
-        let conflict = journal
+        let report = journal
             .publish(&admission, &batch(&[metric_upsert("obs-1", 1, "7")]))
-            .expect_err("a rewritten payload at one revision");
-        assert_eq!(conflict.code, "usage_journal_event_conflict");
+            .expect("a refused observation lands in the report");
+        assert!(report.events.is_empty(), "the conflict settled nothing");
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(
+            report.refused[0].failure.code,
+            "usage_journal_event_conflict"
+        );
         assert_eq!(
             journal
                 .settled_total(SCOPE, METRIC)
@@ -1810,6 +2046,154 @@ mod tests {
             Some("120"),
             "the settled fact stands"
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_correction_that_drops_a_metric_withdraws_the_fact_it_owned() {
+        let root = root("reconcile");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        let admission = source_admission("epoch-1", SettlementEligibility::SettlementEligible);
+        journal
+            .publish(
+                &admission,
+                &batch(&[upsert(
+                    "obs-1",
+                    1,
+                    vec![
+                        (METRIC, reading("120")),
+                        ("gen.tokens.output", reading("30")),
+                    ],
+                )]),
+            )
+            .expect("settled");
+        assert_eq!(facts(&journal).len(), 2);
+
+        // The correction reports only one metric: the dropped one was this
+        // event's fact, so it leaves the ledger instead of counting a stale
+        // value forever.
+        let corrected = journal
+            .publish(&admission, &batch(&[metric_upsert("obs-1", 2, "140")]))
+            .expect("corrected");
+        assert_eq!(corrected.events[0].outcome, EventOutcome::Corrected);
+        let remaining = facts(&journal);
+        assert_eq!(remaining.len(), 1, "the dropped metric's fact is gone");
+        assert_eq!(remaining[0].metric, METRIC);
+        assert_eq!(
+            journal
+                .settled_total(SCOPE, METRIC)
+                .expect("total")
+                .as_deref(),
+            Some("140")
+        );
+        assert_eq!(
+            journal
+                .settled_total(SCOPE, "gen.tokens.output")
+                .expect("total"),
+            None
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_correction_that_moves_scope_reconciles_the_old_scope_facts() {
+        let root = root("rescope");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        let binding = SourceBinding::new(
+            SOURCE,
+            EXTENSION,
+            "instance-1",
+            1,
+            "epoch-1",
+            [SCOPE, "scope:other"],
+        )
+        .expect("binding");
+        let admission = SourceAdmission::new(binding, SettlementEligibility::SettlementEligible);
+        journal
+            .publish(&admission, &batch(&[metric_upsert("obs-1", 1, "120")]))
+            .expect("settled");
+
+        // A higher revision re-keyed to another scope: the old-scope facts the
+        // event owned are reconciled away, not left counting under a scope the
+        // producer no longer claims.
+        let mut moved = metric_upsert("obs-1", 2, "130");
+        moved.scope_ref = "scope:other".to_owned();
+        let corrected = journal
+            .publish(&admission, &batch(&[moved]))
+            .expect("corrected");
+        assert_eq!(corrected.events[0].outcome, EventOutcome::Corrected);
+        assert_eq!(journal.settled_total(SCOPE, METRIC).expect("total"), None);
+        assert_eq!(
+            journal
+                .settled_total("scope:other", METRIC)
+                .expect("total")
+                .as_deref(),
+            Some("130")
+        );
+        assert_eq!(
+            facts(&journal).len(),
+            1,
+            "one fact, under the new scope only"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_mixed_page_advances_the_cursor_over_what_settled() {
+        let root = root("mixed-page");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        let admission = source_admission("epoch-1", SettlementEligibility::SettlementEligible);
+        journal
+            .publish(&admission, &batch(&[metric_upsert("obs-1", 1, "120")]))
+            .expect("settled");
+
+        // A page that validates as an envelope but carries one observation
+        // settlement refuses: the neighbours still commit and the cursor still
+        // advances over the page the source delivered.
+        let page = QueryPage {
+            source_epoch: "epoch-1".to_owned(),
+            scope_ref: SCOPE.to_owned(),
+            observations: vec![
+                metric_upsert("obs-1", 1, "999"),
+                metric_upsert("obs-2", 1, "80"),
+            ],
+            next_cursor: Some(Cursor::new("epoch-1", 7).expect("cursor").encode()),
+            has_more: true,
+        };
+
+        let report = journal
+            .admit_page(&admission, &pull(), &page)
+            .expect("the page settles what it may");
+        assert_eq!(report.events.len(), 1);
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(report.refused[0].index, 0);
+        assert_eq!(
+            report.refused[0].failure.code,
+            "usage_journal_event_conflict"
+        );
+        assert_eq!(
+            report.cursor.as_deref(),
+            Some("7@epoch-1"),
+            "the cursor moved over the processed page, invalid item included"
+        );
+        assert_eq!(
+            journal
+                .settled_total(SCOPE, METRIC)
+                .expect("total")
+                .as_deref(),
+            Some("200"),
+            "the conflicting redelivery rewrote nothing and the valid neighbour settled"
+        );
+
+        // The durable cursor the next pull resumes from is the page's position,
+        // not the refused observation's.
+        let resumed = journal
+            .resume_request(&admission, SCOPE, None)
+            .expect("resumed");
+        assert_eq!(resumed.cursor.as_deref(), Some("7@epoch-1"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2057,7 +2441,7 @@ mod tests {
     }
 
     #[test]
-    fn a_consumer_records_a_fact_by_identity_without_taking_the_events_ownership() {
+    fn a_consumer_records_only_facts_it_owns() {
         let root = root("consumer");
         let mut journal = UsageJournal::open(&params(&root)).expect("journal");
         let admission = source_admission("epoch-1", SettlementEligibility::SettlementEligible);
@@ -2067,37 +2451,69 @@ mod tests {
         let settled = facts(&journal);
         assert_eq!(settled.len(), 1);
 
-        // A consumer records the reading it holds by identity: it corrects the
-        // value in place instead of adding a second fact, and the fact stays
-        // the event's.
-        let mut corrected = settled[0].clone();
-        corrected.value = Some("130".to_owned());
-        let receipt = journal.record(corrected).expect("recorded");
-        assert_eq!(receipt.outcome, FactOutcome::Updated);
-        assert_eq!(
-            facts(&journal).len(),
-            1,
-            "a correction is not a second fact"
-        );
+        // A consumer correcting the event's fact by identity is refused: the
+        // fact names its owner and the consumer is not it.
+        let mut stolen = settled[0].clone();
+        stolen.value = Some("130".to_owned());
+        let error = journal
+            .record("native:agent-1", stolen)
+            .expect_err("a consumer cannot rewrite an event's fact");
+        assert!(!error.retryable);
         assert_eq!(
             journal
                 .settled_total(SCOPE, METRIC)
                 .expect("total")
                 .as_deref(),
-            Some("130")
+            Some("120"),
+            "the event's fact keeps its settled value"
         );
 
-        // The event still owns the fact it settled, so retracting the event
-        // withdraws it rather than leaving a consumer's value behind.
-        let withdrawn = journal
-            .publish(&admission, &batch(&[retraction("obs-1", 2)]))
+        // The consumer's own fact it may record and correct in place.
+        let owned = MeteringFact {
+            fact_id: format!("{SCOPE}#consumer:native:agent-1#{METRIC}"),
+            scope_ref: SCOPE.to_owned(),
+            metric: METRIC.to_owned(),
+            value: Some("7".to_owned()),
+            unit: "tokens".to_owned(),
+            quality: Quality::Reported,
+            eligibility: SettlementEligibility::SettlementEligible,
+            source_ref: "native:agent-1".to_owned(),
+            observed_at: "2026-09-21T00:00:00Z".to_owned(),
+        };
+        let receipt = journal
+            .record("native:agent-1", owned.clone())
+            .expect("recorded");
+        assert_eq!(receipt.outcome, FactOutcome::Inserted);
+        let mut corrected = owned.clone();
+        corrected.value = Some("8".to_owned());
+        let receipt = journal
+            .record("native:agent-1", corrected)
+            .expect("corrected");
+        assert_eq!(receipt.outcome, FactOutcome::Updated);
+        assert_eq!(facts(&journal).len(), 2);
+
+        // And a fact that names another owner never reaches the store.
+        let mut foreign = owned.clone();
+        foreign.fact_id = format!("{SCOPE}#consumer:native:agent-1#foreign");
+        foreign.source_ref = "native:agent-2".to_owned();
+        let error = journal
+            .record("native:agent-1", foreign)
+            .expect_err("an owner cannot write under another's name");
+        assert!(!error.retryable);
+
+        // Retract follows the same ownership: the consumer withdraws only its
+        // own fact, never the event's.
+        let error = journal
+            .retract("native:agent-1", &settled[0].fact_id)
+            .expect_err("a consumer cannot retract an event's fact");
+        assert!(!error.retryable);
+        let receipt = journal
+            .retract(
+                "native:agent-1",
+                &format!("{SCOPE}#consumer:native:agent-1#{METRIC}"),
+            )
             .expect("withdrawn");
-        assert_eq!(withdrawn.events[0].outcome, EventOutcome::Withdrawn);
-        assert!(
-            facts(&journal).is_empty(),
-            "the event withdraws the fact it still owns"
-        );
-        assert_eq!(journal.settled_total(SCOPE, METRIC).expect("total"), None);
+        assert_eq!(receipt.outcome, FactOutcome::Withdrawn);
 
         let _ = fs::remove_dir_all(root);
     }

@@ -30,6 +30,18 @@
 //! charge: the host grants [`SettlementEligibility`], and a reading whose
 //! producer counted requests without tokens settles as `unknown` with no
 //! number, because a zero would be a claim that nothing happened.
+//!
+//! Retention is durable, not time-windowed. A fact's identity is derived from
+//! what it measures (`scope#identity#metric`), so a day-model reading that a
+//! later scan reports again updates its row in place — the store grows with
+//! distinct measurements, never with redeliveries. The purge path is the same
+//! one settlement uses: a consumer withdraws what it owns through
+//! [`MeteringFactPort::retract`], and an event's facts leave when the event's
+//! revision retracts them. The retained-report collection that projects these
+//! facts carries its own byte-and-count retention in `persistence`, and the
+//! gateway counters carry theirs (`MAX_DAYS`, a rolling window enforced on
+//! every record) — the ledger is the source of truth those bounded views read,
+//! so it keeps history rather than expiring it.
 
 use crate::contract::HistoryUsageSummary;
 use crate::journal::{
@@ -37,10 +49,10 @@ use crate::journal::{
     MeteringFactPort, PendingObligation, SettlementEligibility, SourceAdmission, UsageJournal,
     UsageSourcePort,
 };
-use crate::ledger::{
+use crate::persistence::client_state_store;
+use acativa::usage_ledger::{
     LedgerError, LedgerResult, WORKFLOW_LEDGER_FILE_NAME, WORKFLOW_LEDGER_SCHEMA_VERSION,
 };
-use crate::persistence::client_state_store;
 use licoup_extension_contracts::usage::Quality;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -136,6 +148,19 @@ impl UsageSourceHost {
             .join(WORKFLOW_LEDGER_FILE_NAME)
     }
 
+    /// Issue the admission one source presents to the journal: the binding the
+    /// transport negotiated plus the settlement authority the host grants.
+    /// This is the only public minting of a [`SourceAdmission`] — the journal
+    /// requires one by reference at every entry point, so a source that never
+    /// passed through the host cannot present itself as settled.
+    pub fn admit_source(
+        &self,
+        binding: SourceBinding,
+        eligibility: SettlementEligibility,
+    ) -> SourceAdmission {
+        SourceAdmission::new(binding, eligibility)
+    }
+
     /// Settle one bounded batch a source pushed (`usage.publish`).
     pub fn publish(
         &mut self,
@@ -181,19 +206,23 @@ impl UsageSourceHost {
         UsageSourcePort::durable_cursor(&self.journal, binding)
     }
 
-    /// Record one fact, keyed by `fact_id`.
-    pub fn record(&mut self, fact: MeteringFact) -> LedgerResult<FactReceipt> {
-        MeteringFactPort::record(&mut self.journal, fact)
+    /// Record one fact the named consumer owns, keyed by `fact_id`.
+    pub fn record(&mut self, owner: &str, fact: MeteringFact) -> LedgerResult<FactReceipt> {
+        MeteringFactPort::record(&mut self.journal, owner, fact)
     }
 
-    /// Record a bounded set of facts as one delivery.
-    pub fn record_all(&mut self, facts: Vec<MeteringFact>) -> LedgerResult<Vec<FactReceipt>> {
-        MeteringFactPort::record_all(&mut self.journal, facts)
+    /// Record a bounded set of facts the named consumer owns as one delivery.
+    pub fn record_all(
+        &mut self,
+        owner: &str,
+        facts: Vec<MeteringFact>,
+    ) -> LedgerResult<Vec<FactReceipt>> {
+        MeteringFactPort::record_all(&mut self.journal, owner, facts)
     }
 
-    /// Withdraw one fact by identity.
-    pub fn retract(&mut self, fact_id: &str) -> LedgerResult<FactReceipt> {
-        MeteringFactPort::retract(&mut self.journal, fact_id)
+    /// Withdraw one fact the named consumer owns, by identity.
+    pub fn retract(&mut self, owner: &str, fact_id: &str) -> LedgerResult<FactReceipt> {
+        MeteringFactPort::retract(&mut self.journal, owner, fact_id)
     }
 
     /// Read facts, by cursor.
@@ -283,7 +312,8 @@ impl UsageSourceHost {
         if facts.is_empty() {
             return Ok(ReadingSettlement::default());
         }
-        let receipts = self.record_all(facts)?;
+        let owner = format!("native:{agent_id}");
+        let receipts = self.record_all(&owner, facts)?;
         let mut settlement = ReadingSettlement {
             facts: receipts.len(),
             unknown_readings,
@@ -687,7 +717,7 @@ mod tests {
         let mut restarted = UsageSourceHost::open(&params(&state)).expect("restarted owner");
         assert_eq!(
             restarted
-                .durable_cursor(&admission.binding)
+                .durable_cursor(admission.binding())
                 .expect("cursor")
                 .as_deref(),
             Some("1@epoch-1"),
@@ -730,9 +760,12 @@ mod tests {
         host.publish(&admission, &batch(&[upsert("obs-1", 1, "120")]))
             .expect("settled");
 
-        let failure = host
+        let report = host
             .publish(&admission, &batch(&[upsert("obs-1", 1, "130")]))
-            .expect_err("a same-revision conflict is refused");
+            .expect("a refused observation lands in the report");
+        assert!(report.events.is_empty(), "the conflict settled nothing");
+        assert_eq!(report.refused.len(), 1);
+        let failure = &report.refused[0].failure;
         assert_eq!(failure.code, "usage_journal_event_conflict");
         assert_eq!(failure.stage, "usage-journal");
         assert!(!failure.retryable);
