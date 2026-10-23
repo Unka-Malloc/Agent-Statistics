@@ -257,6 +257,22 @@ impl QueryPage {
         }
         Ok(())
     }
+
+    /// Refuse a page that does not answer the request it was read for.
+    ///
+    /// [`validate`] is structural: any page consistent with itself passes, so a
+    /// page stamped with *another* authorized scope would still validate. The
+    /// response must instead equal the request the host issued — a source that
+    /// was asked for scope A and returned scope B has not answered the query,
+    /// and admitting it would advance the wrong position.
+    pub fn check_request(&self, request: &QueryRequest) -> Result<(), ApplicationFailure> {
+        if self.scope_ref != request.scope_ref {
+            return Err(refusal("usage_page_scope_mismatch")
+                .with_field("scopeRef")
+                .with_presentation_arg("requestedScope", &request.scope_ref));
+        }
+        Ok(())
+    }
 }
 
 /// An opaque resume position inside one source epoch.
@@ -496,6 +512,20 @@ mod tests {
             page.validate().expect_err("other epoch").field.as_deref(),
             Some("sourceEpoch")
         );
+    }
+
+    #[test]
+    fn a_page_must_answer_the_scope_it_was_asked_for() {
+        let request = QueryRequest::new("scope-a", None, None).expect("request");
+        let mut page = QueryPage::empty("epoch-1", "scope-a");
+        assert!(page.check_request(&request).is_ok());
+
+        page.scope_ref = "scope-b".to_owned();
+        let failure = page
+            .check_request(&request)
+            .expect_err("a page for another scope");
+        assert_eq!(failure.code, "usage_page_scope_mismatch");
+        assert_eq!(failure.field.as_deref(), Some("scopeRef"));
     }
 
     #[test]
