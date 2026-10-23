@@ -2235,6 +2235,10 @@ mod tests {
         let report = journal
             .admit_page(&admission, &pull(), &page)
             .expect("the page settles what it may");
+        assert_eq!(
+            report.accepted, 2,
+            "both observations bound — the conflict is a settlement refusal"
+        );
         assert_eq!(report.events.len(), 1);
         assert_eq!(report.refused.len(), 1);
         assert_eq!(report.refused[0].index, 0);
