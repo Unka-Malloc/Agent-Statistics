@@ -244,7 +244,16 @@ impl FieldMapping {
                 let currency = read_path(record, &mapping.currency)
                     .map_err(|_| refusal("usage_mapping_invalid").with_field("cost.currency"))?;
                 match (amount, currency) {
-                    (None, _) | (_, None) => None,
+                    (None, None) => None,
+                    // Half a cost report is a claim, not silence: an amount
+                    // without its currency (or the reverse) is refused rather
+                    // than read as "no cost reported".
+                    (None, Some(_)) => {
+                        return Err(refusal("usage_cost_invalid").with_field("cost.amount"));
+                    }
+                    (Some(_), None) => {
+                        return Err(refusal("usage_cost_invalid").with_field("cost.currency"));
+                    }
                     (Some(amount), Some(currency)) => {
                         let currency = currency.as_str().ok_or_else(|| {
                             refusal("usage_cost_invalid").with_field("cost.currency")
@@ -628,6 +637,40 @@ mod tests {
         assert_eq!(tokens.value, None, "a missing count is not a zero");
         assert_eq!(bound.observation.source_epoch, "epoch-1");
         assert_eq!(bound.observation.scope_ref, "scope-1");
+    }
+
+    #[test]
+    fn half_a_cost_report_is_refused() {
+        let mut mapping = specialist_mapping();
+        mapping.cost = Some(CostFieldMapping {
+            amount: "cost.amount".to_owned(),
+            currency: "cost.currency".to_owned(),
+            quality: Quality::Reported,
+        });
+        let amount_only = serde_json::json!({
+            "id": "run-1", "at": "2026-09-21T00:00:00Z", "items": 42,
+            "cost": { "amount": "0.0042" },
+        });
+        assert_eq!(
+            mapping
+                .normalize(&amount_only, &binding(), None)
+                .expect_err("amount without currency")
+                .field
+                .as_deref(),
+            Some("cost.currency")
+        );
+        let currency_only = serde_json::json!({
+            "id": "run-1", "at": "2026-09-21T00:00:00Z", "items": 42,
+            "cost": { "currency": "USD" },
+        });
+        assert_eq!(
+            mapping
+                .normalize(&currency_only, &binding(), None)
+                .expect_err("currency without amount")
+                .field
+                .as_deref(),
+            Some("cost.amount")
+        );
     }
 
     #[test]

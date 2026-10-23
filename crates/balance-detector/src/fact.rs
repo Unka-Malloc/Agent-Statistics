@@ -14,6 +14,9 @@ use crate::refusal;
 /// unbounded list.
 pub const MAX_FACTS_PER_READ: usize = 32;
 
+/// The longest unit label a quota amount may name.
+pub const MAX_UNIT_BYTES: usize = 32;
+
 /// The subscription period a quota fact describes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QuotaWindow {
@@ -135,7 +138,7 @@ impl BalanceFact {
                     return Err(refusal("balance_fact_invalid").with_field("quota.remainingAmount"));
                 }
                 if let Some(unit) = unit
-                    && (unit.is_empty() || unit.len() > 32)
+                    && (unit.is_empty() || unit.len() > MAX_UNIT_BYTES)
                 {
                     return Err(refusal("balance_fact_invalid").with_field("quota.unit"));
                 }
