@@ -221,9 +221,11 @@ impl EventSettlement {
 #[derive(Clone, Debug, PartialEq)]
 pub struct IngestReport {
     pub source_ref: String,
-    /// Observations the transport binding accepted.
+    /// Observations that passed binding validation — accepted for settlement,
+    /// whether each then settled or reported its own refusal.
     pub accepted: usize,
-    /// Observations the binding refused, each with the payload position.
+    /// Every refused observation — binding and settlement refusals alike —
+    /// each with its position in the delivered batch or page.
     pub refused: Vec<BatchRefusal>,
     pub events: Vec<EventSettlement>,
     /// The durable position of this source after the delivery.
@@ -488,16 +490,25 @@ impl UsageSourcePort for UsageJournal {
         admission: &SourceAdmission,
         batch: &PublishBatch,
     ) -> LedgerResult<IngestReport> {
-        let admitted = admission.binding.admit_batch(batch);
+        // Bind each payload under its own batch position: the refused index a
+        // producer reads back must point at its record, not at a slot in a
+        // filtered list.
+        let mut bound_items = Vec::with_capacity(batch.observations().len());
+        let mut refused = Vec::new();
+        for (index, value) in batch.observations().iter().enumerate() {
+            match admission.binding.bind_value(value.clone(), None) {
+                Ok(bound) => bound_items.push((index, bound)),
+                Err(failure) => refused.push(BatchRefusal { index, failure }),
+            }
+        }
         let transaction = self
             .ledger
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| LedgerError::storage())?;
-        let mut events = Vec::with_capacity(admitted.accepted.len());
-        let accepted_count = admitted.accepted_count();
-        let mut refused = admitted.refused;
-        for (index, bound) in admitted.accepted.iter().enumerate() {
+        let mut events = Vec::with_capacity(bound_items.len());
+        let accepted_count = bound_items.len();
+        for (index, bound) in &bound_items {
             match settle_event(&transaction, admission, bound) {
                 Ok(settlement) => events.push(settlement),
                 // A settlement refusal isolates to its own observation: the
@@ -505,7 +516,7 @@ impl UsageSourcePort for UsageJournal {
                 // is different — nothing commits over a broken store.
                 Err(error) if error.retryable => return Err(error),
                 Err(error) => refused.push(BatchRefusal {
-                    index,
+                    index: *index,
                     failure: failure_from(error),
                 }),
             }
@@ -603,6 +614,7 @@ impl UsageSourcePort for UsageJournal {
 
         let mut events = Vec::with_capacity(page.observations.len());
         let mut refused = Vec::new();
+        let mut bound_count = 0usize;
         let transaction = self
             .ledger
             .connection
@@ -613,16 +625,19 @@ impl UsageSourcePort for UsageJournal {
                 .binding
                 .bind_observation(observation.clone(), None)
             {
-                Ok(bound) => match settle_event(&transaction, admission, &bound) {
-                    Ok(settlement) => events.push(settlement),
-                    // Same isolation as publish: a refused observation reports
-                    // itself and does not pin the page's cursor.
-                    Err(error) if error.retryable => return Err(error),
-                    Err(error) => refused.push(BatchRefusal {
-                        index,
-                        failure: failure_from(error),
-                    }),
-                },
+                Ok(bound) => {
+                    bound_count += 1;
+                    match settle_event(&transaction, admission, &bound) {
+                        Ok(settlement) => events.push(settlement),
+                        // Same isolation as publish: a refused observation
+                        // reports itself and does not pin the page's cursor.
+                        Err(error) if error.retryable => return Err(error),
+                        Err(error) => refused.push(BatchRefusal {
+                            index,
+                            failure: failure_from(error),
+                        }),
+                    }
+                }
                 Err(failure) => refused.push(BatchRefusal { index, failure }),
             }
         }
@@ -669,9 +684,11 @@ impl UsageSourcePort for UsageJournal {
             }
         };
         transaction.commit().map_err(|_| LedgerError::storage())?;
+        // `accepted` counts what bound, not what settled — the same meaning
+        // `publish` reports, so one report shape reads one way.
         Ok(IngestReport {
             source_ref: admission.binding.source_ref.clone(),
-            accepted: events.len(),
+            accepted: bound_count,
             refused,
             events,
             cursor,
@@ -2045,6 +2062,57 @@ mod tests {
                 .as_deref(),
             Some("120"),
             "the settled fact stands"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refusals_point_at_their_own_positions_across_both_stages() {
+        let root = root("indexes");
+        let mut journal = UsageJournal::open(&params(&root)).expect("journal");
+        let admission = source_admission("epoch-1", SettlementEligibility::SettlementEligible);
+        journal
+            .publish(&admission, &batch(&[metric_upsert("obs-1", 1, "120")]))
+            .expect("settled");
+
+        // Position 0 fails at binding (it claims another extension); position
+        // 1 binds but conflicts at settlement; position 2 settles. Each
+        // refusal names the record it belongs to, not a slot in a filtered
+        // list.
+        let mut forged = payload(&metric_upsert("obs-2", 1, "80"));
+        forged["extensionId"] = Value::String("someone.else".to_owned());
+        let batch = PublishBatch::new(vec![
+            forged,
+            payload(&metric_upsert("obs-1", 1, "999")),
+            payload(&metric_upsert("obs-3", 1, "7")),
+        ])
+        .expect("batch");
+
+        let report = journal.publish(&admission, &batch).expect("delivered");
+        assert_eq!(report.accepted, 2, "two payloads bound");
+        assert_eq!(report.events.len(), 1, "one settled");
+        assert_eq!(report.refused.len(), 2);
+        assert_eq!(
+            report
+                .refused
+                .iter()
+                .map(|refusal| refusal.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "a binding refusal at 0 must not shift the settlement refusal to 0"
+        );
+        assert_eq!(report.refused[0].failure.code, "usage_source_self_asserted");
+        assert_eq!(
+            report.refused[1].failure.code,
+            "usage_journal_event_conflict"
+        );
+        assert_eq!(
+            journal
+                .settled_total(SCOPE, METRIC)
+                .expect("total")
+                .as_deref(),
+            Some("127")
         );
 
         let _ = fs::remove_dir_all(root);

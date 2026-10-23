@@ -207,6 +207,13 @@ impl UsageSourceHost {
     }
 
     /// Record one fact the named consumer owns, keyed by `fact_id`.
+    ///
+    /// `owner` is a consistency label the host assigns, not an authentication
+    /// boundary: the journal enforces that the fact names the same owner and
+    /// never lets a consumer write rewrite an event-owned fact, but any code
+    /// holding this host handle can speak for any owner name. Callers are the
+    /// trusted host composition; inter-consumer isolation lives in the
+    /// admission boundary, not here.
     pub fn record(&mut self, owner: &str, fact: MeteringFact) -> LedgerResult<FactReceipt> {
         MeteringFactPort::record(&mut self.journal, owner, fact)
     }
