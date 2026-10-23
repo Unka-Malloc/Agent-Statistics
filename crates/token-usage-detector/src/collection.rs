@@ -262,14 +262,27 @@ impl QueryPage {
     ///
     /// [`validate`] is structural: any page consistent with itself passes, so a
     /// page stamped with *another* authorized scope would still validate. The
-    /// response must instead equal the request the host issued — a source that
-    /// was asked for scope A and returned scope B has not answered the query,
-    /// and admitting it would advance the wrong position.
+    /// response must instead equal the request the host issued:
+    ///
+    /// - the page answers the same scope the request named;
+    /// - the page is no larger than the limit the request declared, so a
+    ///   source cannot exceed the bound it was asked under;
+    /// - a resumed request's cursor belongs to the epoch the page was read
+    ///   from — an old-epoch cursor against a post-reset page is the stale
+    ///   resume the cursor exists to refuse.
     pub fn check_request(&self, request: &QueryRequest) -> Result<(), ApplicationFailure> {
         if self.scope_ref != request.scope_ref {
             return Err(refusal("usage_page_scope_mismatch")
                 .with_field("scopeRef")
                 .with_presentation_arg("requestedScope", &request.scope_ref));
+        }
+        if self.observations.len() > request.limit as usize {
+            return Err(refusal("usage_page_over_limit")
+                .with_field("observations")
+                .with_presentation_arg("limit", &request.limit.to_string()));
+        }
+        if let Some(cursor) = &request.cursor {
+            Cursor::parse(cursor)?.check_epoch(&self.source_epoch)?;
         }
         Ok(())
     }
@@ -526,6 +539,39 @@ mod tests {
             .expect_err("a page for another scope");
         assert_eq!(failure.code, "usage_page_scope_mismatch");
         assert_eq!(failure.field.as_deref(), Some("scopeRef"));
+    }
+
+    #[test]
+    fn a_page_may_not_exceed_the_limit_it_was_asked_under() {
+        let request = QueryRequest::new("scope-a", None, Some(1)).expect("request");
+        let mut page = QueryPage::empty("epoch-1", "scope-a");
+        page.observations = vec![
+            licoup_extension_contracts::usage::UsageObservation::from_value(payload("obs-1"))
+                .expect("one"),
+            licoup_extension_contracts::usage::UsageObservation::from_value(payload("obs-2"))
+                .expect("two"),
+        ];
+        let failure = page
+            .check_request(&request)
+            .expect_err("two readings under a limit of one");
+        assert_eq!(failure.code, "usage_page_over_limit");
+
+        let roomier = QueryRequest::new("scope-a", None, Some(2)).expect("request");
+        assert!(page.check_request(&roomier).is_ok());
+    }
+
+    #[test]
+    fn a_resumed_page_must_share_the_cursors_epoch() {
+        let cursor = Cursor::new("epoch-1", 3).expect("cursor").encode();
+        let request = QueryRequest::new("scope-a", Some(cursor), None).expect("resumed request");
+        let page = QueryPage::empty("epoch-1", "scope-a");
+        assert!(page.check_request(&request).is_ok());
+
+        let post_reset = QueryPage::empty("epoch-2", "scope-a");
+        let failure = post_reset
+            .check_request(&request)
+            .expect_err("a page from a later epoch");
+        assert_eq!(failure.code, "usage_cursor_epoch_stale");
     }
 
     #[test]
