@@ -1,0 +1,24 @@
+[package]
+name = "agent-statistics"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local usage measurement, aggregation and metering journal engine: the usage journal, incremental projection, windowing, attribution, retained-report persistence, source-host composition and request counters."
+
+[dependencies]
+token-usage-detector.workspace = true
+anyhow.workspace = true
+licoup-client-state.workspace = true
+licoup-extension-contracts.workspace = true
+licoup-foundation.workspace = true
+licoup-model-catalog.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

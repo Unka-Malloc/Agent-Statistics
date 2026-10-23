@@ -1,0 +1,9 @@
+{
+  "name": "tokens.input",
+  "unit": "tokens",
+  "kind": "sum",
+  "temporality": "cumulative",
+  "points": [
+    { "value": 40, "start": "2026-09-21T00:00:00Z", "time": "2026-09-21T00:15:00Z" }
+  ]
+}
