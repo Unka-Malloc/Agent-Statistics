@@ -5,6 +5,8 @@ version = 4
 [[package]]
 name = "acativa"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4dc87324dedcaf2a245b8649c221a5cc117cf39fc67c994d64352a39467c31b"
 dependencies = [
  "anyhow",
  "flate2",
